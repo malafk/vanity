@@ -230,138 +230,15 @@ fn grind(mut args: GrindArgs) {
         logger.path(logfile);
     }
 
-    // Slightly more compact log format
     logger.log_format("[{timestamp} {level}] {message}");
     logger.timestamp_format("%Y-%m-%d %H:%M:%S");
     logger.level(Level::Info);
 
-    // Print resource usage
-    logfather::info!("using {} threads", args.num_cpus);
-
-    #[cfg(feature = "gpu")]
-    let num_gpus = unsafe { get_gpu_count() };
-    #[cfg(feature = "gpu")]
-    logfather::info!("detected {} GPUs", num_gpus);
-
-    #[cfg(feature = "gpu")]
-    let _gpu_threads: Vec<_> = (0..num_gpus)
-        .map(move |gpu_index| {
-            std::thread::Builder
-                ::new()
-                .name(format!("gpu{gpu_index}"))
-                .spawn(move || {
-                    logfather::trace!("starting gpu {gpu_index}");
-
-                    // Pre-allocate buffers
-                    let mut out = [0u8; 24];
-                    let mut pubkey_bytes = [0u8; 32];
-                    let mut hasher = Sha256::new();
-
-                    for iteration in 0_u64.. {
-                        if EXIT.load(Ordering::SeqCst) {
-                            logfather::trace!("gpu thread {gpu_index} exiting");
-                            return;
-                        }
-
-                        // Generate new seed for this gpu & iteration
-                        let seed = new_gpu_seed(gpu_index, iteration);
-                        let timer = Instant::now();
-
-                        unsafe {
-                            vanity_round(
-                                gpu_index,
-                                seed.as_ref().as_ptr(),
-                                args.base.to_bytes().as_ptr(),
-                                args.owner.to_bytes().as_ptr(),
-                                prefix.as_ptr(),
-                                prefix.len() as u64,
-                                suffix.as_ptr(),
-                                suffix.len() as u64,
-                                any.as_ptr(),
-                                any.len() as u64,
-                                out.as_mut_ptr(),
-                                args.case_insensitive,
-                                args.leet_speak
-                            );
-                        }
-
-                        let time_sec = timer.elapsed().as_secs_f64();
-
-                        // Reuse hasher and buffer for pubkey calculation
-                        hasher.reset();
-                        hasher.update(&args.base);
-                        hasher.update(&out[..16]);
-                        hasher.update(&args.owner);
-                        pubkey_bytes.copy_from_slice(&hasher.finalize_reset());
-
-                        let pubkey = fd_bs58::encode_32(pubkey_bytes);
-                        let count = u64::from_le_bytes(array::from_fn(|i| out[16 + i]));
-
-                        logfather::info!(
-                            "{}.. found in {:.3} seconds on gpu {gpu_index:>3}; {:>13} iters; {:>12} iters/sec",
-                            &pubkey[..(prefix.len() + suffix.len() + 4).min(40)],
-                            time_sec,
-                            count.to_formatted_string(&Locale::en),
-                            (((count as f64) / time_sec) as u64).to_formatted_string(&Locale::en)
-                        );
-
-                        let rust_matches = matches_vanity_key(
-                            &pubkey,
-                            prefix,
-                            suffix,
-                            any,
-                            args.case_insensitive,
-                            args.leet_speak
-                        );
-
-                        if !rust_matches && (count > 0 || out[16..24].iter().any(|&x| x != 0)) {
-                            logfather::error!("\nMISMATCH DETECTED!");
-                            logfather::error!("CUDA found a match but Rust validation failed");
-                            logfather::error!("Address: {}", pubkey);
-                            logfather::error!("Search criteria:");
-                            logfather::error!("  Prefix: '{}'", prefix);
-                            logfather::error!("  Suffix: '{}'", suffix);
-                            logfather::error!("  Any: '{}'", any);
-                            logfather::error!("  Case insensitive: {}", if args.case_insensitive {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            });
-                            logfather::error!("  Leet speak: {}", if args.leet_speak {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            });
-                            logfather::error!("Seed info:");
-                            logfather::error!("  Bytes: {:?}", &out[..16]);
-                            logfather::error!(
-                                "  UTF-8: {}",
-                                core::str::from_utf8(&out[..16]).unwrap_or("Invalid UTF-8")
-                            );
-                        }
-
-                        if rust_matches {
-                            logfather::info!("\nGPU MATCH FOUND!");
-                            logfather::info!("Full address: {}", pubkey);
-                            logfather::info!("Seed: {:?}", &out[..16]);
-                            logfather::info!(
-                                "UTF-8 seed: {}",
-                                core::str::from_utf8(&out[..16]).unwrap_or("Invalid UTF-8")
-                            );
-
-                            if let Err(err) = save_vanity_key(&pubkey, &out[..16]) {
-                                logfather::error!("{}", err);
-                                return;
-                            }
-                            EXIT.store(true, Ordering::SeqCst);
-                            logfather::trace!("gpu thread {gpu_index} exiting");
-                            return;
-                        }
-                    }
-                })
-                .unwrap()
-        })
-        .collect();
+    logfather::info!("Starting vanity key search...");
+    logfather::info!("Base: {}", args.base);
+    logfather::info!("Owner: {}", args.owner);
+    logfather::info!("Suffix: {}", suffix);
+    logfather::info!("Using {} threads", args.num_cpus);
 
     (0..args.num_cpus).into_par_iter().for_each(|i| {
         let timer = Instant::now();
@@ -373,12 +250,18 @@ fn grind(mut args: GrindArgs) {
                 return;
             }
 
-            let mut seed_iter = rand::thread_rng().sample_iter(&Alphanumeric).take(16);
-            let seed: [u8; 16] = array::from_fn(|_| seed_iter.next().unwrap());
+            // Generate seed using only valid UTF-8 characters
+            let seed: [u8; 16] = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .filter(|&c| c.is_ascii_alphanumeric())
+                .take(16)
+                .collect::<Vec<u8>>()
+                .try_into()
+                .unwrap();
 
             let pubkey_bytes: [u8; 32] = base_sha
                 .clone()
-                .chain_update(seed)
+                .chain_update(&seed)
                 .chain_update(args.owner)
                 .finalize()
                 .into();
@@ -386,22 +269,26 @@ fn grind(mut args: GrindArgs) {
 
             count += 1;
 
-            if
-                matches_vanity_key(
-                    &pubkey,
-                    prefix,
-                    suffix,
-                    any,
-                    args.case_insensitive,
-                    args.leet_speak
-                )
-            {
+            if matches_vanity_key(
+                &pubkey,
+                prefix,
+                suffix,
+                any,
+                args.case_insensitive,
+                args.leet_speak
+            ) {
                 let time_secs = timer.elapsed().as_secs_f64();
+                let seed_str = String::from_utf8_lossy(&seed);
+
                 logfather::info!(
-                    "cpu {i} found key: {pubkey}; {seed:?} -> {} in {:.3}s; {} attempts; {} attempts per second",
-                    core::str::from_utf8(&seed).unwrap(),
-                    time_secs,
-                    count.to_formatted_string(&Locale::en),
+                    "\nFound matching key on CPU thread {}:", i
+                );
+                logfather::info!("Public key: {}", pubkey);
+                logfather::info!("Seed (UTF-8): {}", seed_str);
+                logfather::info!("Search time: {:.3}s", time_secs);
+                logfather::info!("Attempts: {}", count.to_formatted_string(&Locale::en));
+                logfather::info!(
+                    "Speed: {} attempts per second",
                     (((count as f64) / time_secs) as u64).to_formatted_string(&Locale::en)
                 );
 
@@ -536,15 +423,25 @@ fn save_vanity_key(pubkey: &str, seed: &[u8]) -> Result<(), String> {
         format!("Error opening file {}: {}", output_file_path.display(), err)
     )?;
 
+    // Convert seed to UTF-8 string, falling back to hex representation if invalid UTF-8
+    let seed_utf8 = String::from_utf8_lossy(seed);
+
+    // Write both the raw bytes and UTF-8 representation
     write!(
         file,
-        "{} -> {:?} [{}]",
+        "Public Key: {}\nSeed (UTF-8): {}\nSeed (bytes): {:?}\n",
         pubkey,
-        seed,
-        core::str::from_utf8(seed).unwrap_or("Invalid UTF-8")
+        seed_utf8,
+        seed
     ).map_err(|err| format!("Error writing to file {}: {}", output_file_path.display(), err))?;
 
-    logfather::info!("Successfully saved output to {}", output_file_path.display());
+    // Also display in console
+    logfather::info!("\nMatch found!");
+    logfather::info!("Public Key: {}", pubkey);
+    logfather::info!("Seed (UTF-8): {}", seed_utf8);
+    logfather::info!("Seed (bytes): {:?}", seed);
+    logfather::info!("Output saved to: {}", output_file_path.display());
+
     Ok(())
 }
 
